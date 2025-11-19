@@ -36,15 +36,16 @@ pub async fn detect_filename(
     if let Some(ua) = user_agent {
         req = req.header("User-Agent", ua);
     } else {
-        req = req.header("User-Agent", "dlfast/1.0");
+        req = req.header("User-Agent", "dlrs/1.0");
     }
 
     let resp = req.send().await?;
 
-    if let Some(name) = resp.headers()
+    if let Some(name) = resp
+        .headers()
         .get(CONTENT_DISPOSITION)
         .and_then(|cd| cd.to_str().ok())
-        .and_then(parse_content_disposition) 
+        .and_then(parse_content_disposition)
     {
         return Ok(sanitize_filename(&name));
     }
@@ -184,12 +185,12 @@ pub async fn download_file(
                     libc::kill(-(id as i32), libc::SIGTERM);
                 }
             }
-            
+
             #[cfg(not(unix))]
             let _ = child.start_kill();
 
             let _ = child.wait().await;
-            
+
             if let Some(bar) = pb {
                 bar.finish_with_message(format!("⚠ Cancelled {}", filename));
             }

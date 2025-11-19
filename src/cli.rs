@@ -2,10 +2,10 @@ use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "dlfast",
+    name = "dlrs",
     version = "1.0",
     about = "High-performance basic download tool powered by aria2c",
-    long_about = "dlfast is a basic wrapper around aria2c that provides optimized defaults and a modern CLI experience."
+    long_about = "dlrs is a basic wrapper around aria2c that provides optimized defaults and a modern CLI experience."
 )]
 pub struct Cli {
     /// Target directory for downloads

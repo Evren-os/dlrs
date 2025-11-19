@@ -102,7 +102,7 @@ pub fn setup_destination(destination: Option<&String>) -> Result<PathBuf> {
     };
 
     // Test write permissions
-    let temp_file_path = target_dir.join(".dlfast-write-check");
+    let temp_file_path = target_dir.join(".dlrs-write-check");
     std::fs::write(&temp_file_path, "")
         .context(format!("Directory '{:?}' is not writable", target_dir))?;
     std::fs::remove_file(&temp_file_path).ok();

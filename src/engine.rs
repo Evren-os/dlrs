@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -104,6 +105,7 @@ pub fn build_aria2c_args(target_dir: &str, filename: &str, url: &str, config: &C
         "--async-dns=true".to_string(),
         "--http-accept-gzip=true".to_string(),
         "--remote-time=true".to_string(),
+        "--human-readable=false".to_string(),
     ];
 
     if let Some(speed) = &config.max_speed {
@@ -145,13 +147,15 @@ pub async fn download_file(
     let args = build_aria2c_args(target_dir, &filename, &item.url, config);
 
     let pb = if let Some(m) = mp {
-        let pb = m.add(ProgressBar::new_spinner());
+        let pb = m.add(ProgressBar::new(0));
         pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} {msg}")?
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise:.yellow}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {binary_bytes_per_sec:.magenta} (ETA: {eta:.blue}) {msg}",
+            )?
+            .progress_chars("=>-"),
         );
-        pb.set_message(format!("Downloading {}", filename));
+        pb.set_message(filename.clone());
+        pb.enable_steady_tick(Duration::from_millis(100));
         Some(pb)
     } else {
         None
@@ -165,42 +169,62 @@ pub async fn download_file(
         cmd.process_group(0);
     }
 
-    if config.quiet || mp.is_some() {
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::piped());
-    } else {
-        cmd.stdout(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
-    }
+    // Pipe stdout for progress parsing
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
 
     let mut child = cmd.spawn().context("Failed to spawn aria2c")?;
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+    let mut reader = BufReader::new(stdout).lines();
 
-    let status = tokio::select! {
-        res = child.wait() => res?,
-        _ = cancel_token.cancelled() => {
-            #[cfg(unix)]
-            unsafe {
-                if let Some(id) = child.id() {
-                    // Kill process group (-id)
-                    libc::kill(-(id as i32), libc::SIGTERM);
+    loop {
+        tokio::select! {
+            res = reader.next_line() => {
+                match res {
+                    Ok(Some(line)) => {
+                        if let (Some((down, total)), Some(pb)) =
+                            (crate::utils::parse_aria2_progress(&line), &pb)
+                        {
+                            pb.set_length(total);
+                            pb.set_position(down);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
             }
+            _ = cancel_token.cancelled() => {
+                #[cfg(unix)]
+                unsafe {
+                    if let Some(id) = child.id() {
+                        // Send SIGINT to allow aria2c to graceful shutdown
+                        // Target process group to ensure all children are notified
+                        let pid = id as i32;
+                        let _ = libc::kill(-pid, libc::SIGINT);
+                        // Redundant kill to ensure it wakes up/processes
+                        let _ = libc::kill(pid, libc::SIGINT);
+                    }
+                }
 
-            #[cfg(not(unix))]
-            let _ = child.start_kill();
+                #[cfg(not(unix))]
+                let _ = child.start_kill();
 
-            let _ = child.wait().await;
+                let status = child.wait().await;
+                let _ = status;
 
-            if let Some(bar) = pb {
-                bar.finish_with_message(format!("⚠ Cancelled {}", filename));
+                if let Some(bar) = pb {
+                    bar.finish_and_clear();
+                }
+                return Err(anyhow::anyhow!("cancelled"));
             }
-            return Err(anyhow::anyhow!("cancelled"));
         }
-    };
+    }
+
+    let status = child.wait().await?;
 
     if let Some(bar) = pb {
         if status.success() {
-            bar.finish_with_message(format!("✔ Downloaded {}", filename));
+            bar.finish_and_clear();
         } else {
             bar.finish_with_message(format!("✘ Failed {}", filename));
         }

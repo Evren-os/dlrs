@@ -49,6 +49,16 @@ fn is_reserved_name(name: &str) -> bool {
     reserved.contains(&upper.as_str())
 }
 
+static ARIA2_PROGRESS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[#\w+\s+(\d+)B/(\d+)B\(\d+%\)").expect("Invalid regex"));
+
+pub fn parse_aria2_progress(line: &str) -> Option<(u64, u64)> {
+    let caps = ARIA2_PROGRESS_RE.captures(line)?;
+    let downloaded = caps.get(1)?.as_str().parse().ok()?;
+    let total = caps.get(2)?.as_str().parse().ok()?;
+    Some((downloaded, total))
+}
+
 pub fn infer_filename_from_url(raw_url: &str) -> String {
     let u = match Url::parse(raw_url) {
         Ok(u) => u,
@@ -118,7 +128,7 @@ mod tests {
         assert_eq!(sanitize_filename("normal.txt"), "normal.txt");
         assert_eq!(sanitize_filename("fi:le?.txt"), "fi_le_.txt");
         assert_eq!(sanitize_filename("  spaces.txt  "), "spaces.txt");
-        assert_eq!(sanitize_filename("CON"), sanitize_filename("CON")); // Should return timestamped
+        assert_eq!(sanitize_filename("CON"), sanitize_filename("CON"));
         assert!(sanitize_filename("CON").starts_with("download_"));
     }
 
@@ -140,10 +150,20 @@ mod tests {
             infer_filename_from_url("https://example.com/path/to/file.tar.gz"),
             "file.tar.gz"
         );
-        // Host fallback
+        
         assert!(
             infer_filename_from_url("https://example.com/")
                 .starts_with("download_from_example.com")
         );
+    }
+
+    #[test]
+    fn test_parse_aria2_progress() {
+        let line = "[#2089b0 1000B/2000B(50%) CN:1 DL:115KiB]";
+        assert_eq!(parse_aria2_progress(line), Some((1000, 2000)));
+
+        assert_eq!(parse_aria2_progress("Some random output"), None);
+
+        assert_eq!(parse_aria2_progress("[#2089b0 1000B/"), None);
     }
 }

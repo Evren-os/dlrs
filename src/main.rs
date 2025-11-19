@@ -8,9 +8,10 @@ use crate::utils::{setup_destination, validate_url};
 use clap::Parser;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
-use indicatif::MultiProgress;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 
 fn check_aria2c() -> anyhow::Result<()> {
@@ -98,7 +99,7 @@ async fn run_downloads(
         }
     }
 
-    let mp = if cli.parallel_downloads > 1 && !cli.quiet {
+    let mp = if !cli.quiet {
         Some(MultiProgress::new())
     } else {
         None
@@ -107,6 +108,22 @@ async fn run_downloads(
     let cli = Arc::new(cli.clone());
     let target_dir_str = Arc::new(target_dir_str);
     let mp = Arc::new(mp);
+
+    let main_pb = if let Some(mp) = mp.as_ref() {
+        if cli.urls.len() > 1 {
+            let pb = mp.add(ProgressBar::new(cli.urls.len() as u64));
+            pb.set_style(
+                ProgressStyle::with_template("{bar:40.green/white} {pos}/{len} Files")?
+                    .progress_chars("##-"),
+            );
+            pb.enable_steady_tick(Duration::from_millis(100));
+            Some(pb)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let downloads = cli
         .urls
@@ -124,19 +141,26 @@ async fn run_downloads(
             let target_dir_str = target_dir_str.clone();
             let mp = mp.clone();
             let cancel_token = cancel_token.clone();
+            let main_pb = main_pb.clone();
 
             async move {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        Err(anyhow::anyhow!("cancelled"))
-                    }
-                    res = download_file(&mut item, &target_dir_str, &cli, mp.as_ref().as_ref(), cancel_token.clone()) => {
-                        if let Err(e) = res {
-                            Err(anyhow::anyhow!("Failed: {} - {}", item.url, e))
-                        } else {
-                            Ok(())
-                        }
-                    }
+                // Removed outer tokio::select! to ensure download_file handles cleanup logic
+                let res = download_file(
+                    &mut item,
+                    &target_dir_str,
+                    &cli,
+                    mp.as_ref().as_ref(),
+                    cancel_token.clone(),
+                )
+                .await;
+
+                if let Some(pb) = main_pb {
+                    pb.inc(1);
+                }
+                if let Err(e) = res {
+                    Err(anyhow::anyhow!("Failed: {} - {}", item.url, e))
+                } else {
+                    Ok(())
                 }
             }
         })

@@ -86,7 +86,7 @@ pub fn build_aria2c_args(target_dir: &str, filename: &str, url: &str, config: &C
         format!("--dir={}", target_dir),
         format!("--out={}", filename),
         "--continue=true".to_string(),
-        "--max-connection-per-server=8".to_string(),
+        "--max-connection-per-server=16".to_string(),
         "--split=32".to_string(),
         "--min-split-size=1M".to_string(),
         "--file-allocation=falloc".to_string(),

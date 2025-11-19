@@ -10,7 +10,7 @@ This is a port of a personal legacy Go tool, designed to simplify the usage of `
 
 *   **Smart Filename Detection**: Resolves filenames via HTTP `HEAD` requests and `Content-Disposition` headers before `aria2c` starts, preventing generic output names.
 *   **Batch Processing**: Handles multiple URLs in parallel with a configurable concurrency limit.
-*   **Opinionated Defaults**: Automatically configures `aria2c` with optimized settings (8 connections per server, 32 splits, fallocation) for stable and fast downloads.
+*   **Opinionated Defaults**: Automatically configures `aria2c` with optimized settings (16 connections per server, 32 splits, fallocation) for stable and fast downloads.
 *   **Clean UI**: Replaces verbose logs with simple progress spinners for batch operations, while retaining detailed output for single files.
 *   **Resilient**: Handles interruptions (Ctrl+C) gracefully by ensuring child processes are terminated correctly.
 

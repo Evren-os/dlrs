@@ -1,9 +1,11 @@
 mod cli;
 mod engine;
+mod error;
 mod utils;
 
 use crate::cli::Cli;
 use crate::engine::{DownloadItem, download_file};
+use crate::error::DlrsError;
 use crate::utils::{setup_destination, validate_url};
 use clap::Parser;
 use colored::Colorize;
@@ -14,11 +16,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
-fn check_aria2c() -> anyhow::Result<()> {
-    match Command::new("aria2c").arg("--version").output() {
-        Ok(_) => Ok(()),
-        Err(_) => anyhow::bail!("aria2c not found in PATH. Please install aria2c."),
-    }
+fn check_aria2c() -> Result<(), DlrsError> {
+    Command::new("aria2c")
+        .arg("--version")
+        .output()
+        .map_err(|_| DlrsError::Aria2cNotFound)?;
+    Ok(())
 }
 
 fn log_info(msg: &str) {
@@ -50,29 +53,33 @@ async fn main() {
     let cancel_token_clone = cancel_token.clone();
 
     tokio::spawn(async move {
-        if let Ok(()) = signal::ctrl_c().await {
+        if signal::ctrl_c().await.is_ok() {
             eprintln!(
-                "\n{} Received interrupt signal, cancelling downloads...",
+                "\n{} Received interrupt, terminating downloads...",
                 "[WARNING]".yellow()
             );
             cancel_token_clone.cancel();
         }
     });
 
-    if let Err(e) = run_downloads(&cli, cancel_token).await {
-        if e.to_string().contains("cancelled") {
+    match run_downloads(&cli, cancel_token).await {
+        Ok(()) => {
+            if !cli.quiet {
+                let msg = if cli.urls.len() == 1 {
+                    "Download completed successfully!"
+                } else {
+                    "All downloads completed successfully!"
+                };
+                log_success(msg);
+            }
+        }
+        Err(DlrsError::Cancelled) => {
             log_warning("Downloads cancelled.");
             std::process::exit(130);
         }
-        log_error(&format!("{:?}", e));
-        std::process::exit(1);
-    }
-
-    if !cli.quiet {
-        if cli.urls.len() == 1 {
-            log_success("Download completed successfully!");
-        } else {
-            log_success("All downloads completed successfully!");
+        Err(e) => {
+            log_error(&e.to_string());
+            std::process::exit(1);
         }
     }
 }
@@ -80,7 +87,7 @@ async fn main() {
 async fn run_downloads(
     cli: &Cli,
     cancel_token: tokio_util::sync::CancellationToken,
-) -> anyhow::Result<()> {
+) -> Result<(), DlrsError> {
     for url in &cli.urls {
         validate_url(url)?;
     }
@@ -89,43 +96,33 @@ async fn run_downloads(
     let target_dir_str = target_dir.to_string_lossy().to_string();
 
     if !cli.quiet {
-        if cli.urls.len() == 1 {
-            log_info("Starting download...");
+        let msg = if cli.urls.len() == 1 {
+            "Starting download...".to_string()
         } else {
-            log_info(&format!(
-                "Starting batch download of {} files...",
-                cli.urls.len()
-            ));
-        }
+            format!("Starting batch download of {} files...", cli.urls.len())
+        };
+        log_info(&msg);
     }
 
-    let mp = if !cli.quiet {
-        Some(MultiProgress::new())
-    } else {
-        None
-    };
-
+    let mp = (!cli.quiet).then(MultiProgress::new);
     let cli = Arc::new(cli.clone());
     let target_dir_str = Arc::new(target_dir_str);
     let mp = Arc::new(mp);
 
-    let main_pb = if let Some(mp) = mp.as_ref() {
-        if cli.urls.len() > 1 {
-            let pb = mp.add(ProgressBar::new(cli.urls.len() as u64));
+    let main_pb = mp.as_ref().as_ref().and_then(|m| {
+        (cli.urls.len() > 1).then(|| {
+            let pb = m.add(ProgressBar::new(cli.urls.len() as u64));
             pb.set_style(
-                ProgressStyle::with_template("{bar:40.green/white} {pos}/{len} Files")?
+                ProgressStyle::with_template("{bar:40.green/white} {pos}/{len} Files")
+                    .expect("Invalid template")
                     .progress_chars("##-"),
             );
             pb.enable_steady_tick(Duration::from_millis(100));
-            Some(pb)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+            pb
+        })
+    });
 
-    let downloads = cli
+    let downloads: Vec<_> = cli
         .urls
         .iter()
         .map(|u| DownloadItem {
@@ -133,7 +130,7 @@ async fn run_downloads(
             filename: String::new(),
             file_path: String::new(),
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     let mut stream = stream::iter(downloads)
         .map(|mut item| {
@@ -144,24 +141,20 @@ async fn run_downloads(
             let main_pb = main_pb.clone();
 
             async move {
-                // Removed outer tokio::select! to ensure download_file handles cleanup logic
                 let res = download_file(
                     &mut item,
                     &target_dir_str,
                     &cli,
                     mp.as_ref().as_ref(),
-                    cancel_token.clone(),
+                    cancel_token,
                 )
                 .await;
 
                 if let Some(pb) = main_pb {
                     pb.inc(1);
                 }
-                if let Err(e) = res {
-                    Err(anyhow::anyhow!("Failed: {} - {}", item.url, e))
-                } else {
-                    Ok(())
-                }
+
+                res.map_err(|e| DlrsError::Other(format!("{}: {}", item.url, e)))
             }
         })
         .buffer_unordered(cli.parallel_downloads);
@@ -169,17 +162,23 @@ async fn run_downloads(
     let mut errors = Vec::new();
 
     while let Some(res) = stream.next().await {
-        if let Err(e) = res {
-            if e.to_string().contains("cancelled") {
-                return Err(anyhow::anyhow!("cancelled"));
+        match res {
+            Err(DlrsError::Cancelled) => return Err(DlrsError::Cancelled),
+            Err(DlrsError::Other(ref s)) if s.contains("cancelled") => {
+                return Err(DlrsError::Cancelled);
             }
-            errors.push(e);
+            Err(e) => errors.push(e),
+            Ok(()) => {}
         }
     }
 
-    if !errors.is_empty() {
-        return Err(anyhow::anyhow!("some downloads failed: {:?}", errors));
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        let messages: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+        Err(DlrsError::Other(format!(
+            "Some downloads failed:\n  {}",
+            messages.join("\n  ")
+        )))
     }
-
-    Ok(())
 }

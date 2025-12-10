@@ -1,12 +1,13 @@
 use crate::cli::Cli;
+use crate::error::DlrsError;
 use crate::utils::{infer_filename_from_url, sanitize_filename};
-use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::Regex;
 use reqwest::header::CONTENT_DISPOSITION;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -23,24 +24,33 @@ pub struct DownloadItem {
     pub file_path: String,
 }
 
+struct DownloadContext<'a> {
+    item: &'a mut DownloadItem,
+    target_dir: &'a str,
+    config: &'a Cli,
+    mp: Option<&'a MultiProgress>,
+    cancel_token: CancellationToken,
+    attempt: u32,
+}
+
 pub async fn detect_filename(
     url: &str,
     user_agent: Option<&str>,
     timeout_secs: u64,
-) -> Result<String> {
+) -> Result<String, DlrsError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .build()?;
+        .build()
+        .map_err(|e| DlrsError::Other(e.to_string()))?;
 
     let mut req = client.head(url);
-    if let Some(ua) = user_agent {
-        req = req.header("User-Agent", ua);
-    } else {
-        req = req.header("User-Agent", "dlrs/1.0");
-    }
+    req = req.header("User-Agent", user_agent.unwrap_or("dlrs/1.0"));
 
-    let resp = req.send().await?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| DlrsError::Other(e.to_string()))?;
 
     if let Some(name) = resp
         .headers()
@@ -75,45 +85,54 @@ fn decode_rfc5987(encoded: &str) -> Option<String> {
     if parts.len() != 3 {
         return None;
     }
-    // parts[2] is the encoded filename
     url::form_urlencoded::parse(parts[2].as_bytes())
         .map(|(k, _)| k.to_string())
         .next()
 }
 
-pub fn build_aria2c_args(target_dir: &str, filename: &str, url: &str, config: &Cli) -> Vec<String> {
+fn build_aria2c_args(
+    target_dir: &str,
+    filename: &str,
+    url: &str,
+    config: &Cli,
+    reduced_connections: bool,
+) -> Vec<String> {
+    let (connections, splits) = if reduced_connections {
+        (4, 8)
+    } else {
+        (16, 32)
+    };
+
     let mut args = vec![
-        format!("--dir={}", target_dir),
-        format!("--out={}", filename),
-        "--continue=true".to_string(),
-        "--max-connection-per-server=16".to_string(),
-        "--split=32".to_string(),
-        "--min-split-size=1M".to_string(),
-        "--file-allocation=falloc".to_string(),
+        format!("--dir={target_dir}"),
+        format!("--out={filename}"),
+        "--continue=true".into(),
+        format!("--max-connection-per-server={connections}"),
+        format!("--split={splits}"),
+        "--min-split-size=1M".into(),
+        "--file-allocation=falloc".into(),
         format!("--max-tries={}", config.max_tries),
         format!("--retry-wait={}", config.retry_wait),
         format!("--connect-timeout={}", config.connect_timeout),
         format!("--timeout={}", config.timeout),
-        "--max-file-not-found=3".to_string(),
-        "--summary-interval=1".to_string(),
-        "--console-log-level=warn".to_string(),
-        "--auto-file-renaming=false".to_string(),
-        "--allow-overwrite=true".to_string(),
-        "--conditional-get=true".to_string(),
-        "--check-integrity=true".to_string(),
-        "--disk-cache=128M".to_string(),
-        "--async-dns=true".to_string(),
-        "--http-accept-gzip=true".to_string(),
-        "--remote-time=true".to_string(),
-        "--human-readable=false".to_string(),
+        "--max-file-not-found=3".into(),
+        "--summary-interval=1".into(),
+        "--console-log-level=warn".into(),
+        "--auto-file-renaming=false".into(),
+        "--allow-overwrite=true".into(),
+        "--conditional-get=true".into(),
+        "--disk-cache=128M".into(),
+        "--async-dns=true".into(),
+        "--http-accept-gzip=true".into(),
+        "--remote-time=true".into(),
+        "--human-readable=false".into(),
     ];
 
     if let Some(speed) = &config.max_speed {
-        args.push(format!("--max-download-limit={}", speed));
+        args.push(format!("--max-download-limit={speed}"));
     }
-
     if let Some(ua) = &config.user_agent {
-        args.push(format!("--user-agent={}", ua));
+        args.push(format!("--user-agent={ua}"));
     }
 
     args.push(url.to_string());
@@ -126,17 +145,14 @@ pub async fn download_file(
     config: &Cli,
     mp: Option<&MultiProgress>,
     cancel_token: CancellationToken,
-) -> Result<()> {
-    let filename = match detect_filename(
+) -> Result<(), DlrsError> {
+    let filename = detect_filename(
         &item.url,
         config.user_agent.as_deref(),
         config.connect_timeout,
     )
     .await
-    {
-        Ok(n) => n,
-        Err(_) => infer_filename_from_url(&item.url),
-    };
+    .unwrap_or_else(|_| infer_filename_from_url(&item.url));
 
     item.filename = filename.clone();
     item.file_path = Path::new(target_dir)
@@ -144,37 +160,105 @@ pub async fn download_file(
         .to_string_lossy()
         .to_string();
 
-    let args = build_aria2c_args(target_dir, &filename, &item.url, config);
+    let mut ctx = DownloadContext {
+        item,
+        target_dir,
+        config,
+        mp,
+        cancel_token,
+        attempt: 0,
+    };
 
-    let pb = if let Some(m) = mp {
+    let max_retries = config.auto_retry;
+
+    loop {
+        ctx.attempt += 1;
+        let reduced_connections = ctx.attempt > 1;
+
+        match execute_download(&mut ctx, reduced_connections).await {
+            Ok(()) => return Ok(()),
+            Err(DlrsError::Cancelled) => return Err(DlrsError::Cancelled),
+            Err(e) if e.is_transient() && ctx.attempt <= max_retries => {
+                let delay = Duration::from_secs(2u64.pow(ctx.attempt));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn execute_download(
+    ctx: &mut DownloadContext<'_>,
+    reduced_connections: bool,
+) -> Result<(), DlrsError> {
+    let pb = ctx.mp.map(|m| {
         let pb = m.add(ProgressBar::new(0));
         pb.set_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise:.yellow}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {binary_bytes_per_sec:.magenta} (ETA: {eta:.blue}) {msg}",
-            )?
+            )
+            .expect("Invalid template")
             .progress_chars("=>-"),
         );
-        pb.set_message(filename.clone());
+        pb.set_message(ctx.item.filename.clone());
         pb.enable_steady_tick(Duration::from_millis(100));
-        Some(pb)
-    } else {
-        None
-    };
+        pb
+    });
+
+    let expected_size = Arc::new(AtomicU64::new(0));
+    let result = spawn_and_monitor(ctx, &pb, expected_size.clone(), reduced_connections).await;
+
+    let final_size = expected_size.load(Ordering::Relaxed);
+    let file_path = Path::new(&ctx.item.file_path);
+
+    if let Err(DlrsError::DownloadFailed {
+        exit_code: Some(1 | 22),
+        ..
+    }) = &result
+    {
+        if verify_download(file_path, final_size) {
+            if let Some(bar) = pb {
+                bar.finish_and_clear();
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(bar) = pb {
+        match &result {
+            Ok(()) => bar.finish_and_clear(),
+            Err(_) => bar.finish_with_message(format!("✘ Failed {}", ctx.item.filename)),
+        }
+    }
+
+    result
+}
+
+async fn spawn_and_monitor(
+    ctx: &DownloadContext<'_>,
+    pb: &Option<ProgressBar>,
+    expected_size: Arc<AtomicU64>,
+    reduced_connections: bool,
+) -> Result<(), DlrsError> {
+    let args = build_aria2c_args(
+        ctx.target_dir,
+        &ctx.item.filename,
+        &ctx.item.url,
+        ctx.config,
+        reduced_connections,
+    );
 
     let mut cmd = Command::new("aria2c");
-    cmd.args(&args);
+    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::null());
 
     #[cfg(unix)]
     {
         cmd.process_group(0);
     }
 
-    // Pipe stdout for progress parsing
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-
-    let mut child = cmd.spawn().context("Failed to spawn aria2c")?;
-    let stdout = child.stdout.take().expect("Failed to capture stdout");
+    let mut child = cmd.spawn().map_err(|_| DlrsError::Aria2cNotFound)?;
+    let stdout = child.stdout.take().expect("stdout not captured");
     let mut reader = BufReader::new(stdout).lines();
 
     loop {
@@ -182,63 +266,72 @@ pub async fn download_file(
             res = reader.next_line() => {
                 match res {
                     Ok(Some(line)) => {
-                        if let (Some((down, total)), Some(pb)) =
-                            (crate::utils::parse_aria2_progress(&line), &pb)
+                        if let (Some((down, total)), Some(bar)) =
+                            (crate::utils::parse_aria2_progress(&line), pb)
                         {
-                            pb.set_length(total);
-                            pb.set_position(down);
+                            expected_size.store(total, Ordering::Relaxed);
+                            bar.set_length(total);
+                            bar.set_position(down);
                         }
                     }
                     Ok(None) => break,
                     Err(_) => break,
                 }
             }
-            _ = cancel_token.cancelled() => {
-                #[cfg(unix)]
-                unsafe {
-                    if let Some(id) = child.id() {
-                        // Send SIGINT to allow aria2c to graceful shutdown
-                        // Target process group to ensure all children are notified
-                        let pid = id as i32;
-                        let _ = libc::kill(-pid, libc::SIGINT);
-                        // Redundant kill to ensure it wakes up/processes
-                        let _ = libc::kill(pid, libc::SIGINT);
-                    }
-                }
-
-                #[cfg(not(unix))]
-                let _ = child.start_kill();
-
-                let status = child.wait().await;
-                let _ = status;
-
-                if let Some(bar) = pb {
-                    bar.finish_and_clear();
-                }
-                return Err(anyhow::anyhow!("cancelled"));
+            _ = ctx.cancel_token.cancelled() => {
+                kill_child(&mut child).await;
+                return Err(DlrsError::Cancelled);
             }
         }
     }
 
-    let status = child.wait().await?;
+    let status = child.wait().await.map_err(DlrsError::Io)?;
 
-    if let Some(bar) = pb {
-        if status.success() {
-            bar.finish_and_clear();
-        } else {
-            bar.finish_with_message(format!("✘ Failed {}", filename));
-        }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(status
+            .code()
+            .map(DlrsError::download_failed)
+            .unwrap_or(DlrsError::Other("aria2c terminated by signal".into())))
     }
+}
 
-    if !status.success() {
-        match status.code() {
-            Some(3) => anyhow::bail!("file not found or access denied"),
-            Some(9) => anyhow::bail!("not enough disk space available"),
-            Some(28) => anyhow::bail!("network timeout or connection refused"),
-            Some(c) => anyhow::bail!("aria2c failed with exit code {}", c),
-            None => anyhow::bail!("aria2c terminated by signal"),
+#[cfg(unix)]
+async fn kill_child(child: &mut tokio::process::Child) {
+    use std::time::Duration;
+    if let Some(id) = child.id() {
+        let pid = id as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
         }
+        tokio::select! {
+            _ = child.wait() => {}
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                unsafe { libc::killpg(pid, libc::SIGKILL); }
+                let _ = child.wait().await;
+            }
+        }
+    } else {
+        let _ = child.kill().await;
     }
+}
 
-    Ok(())
+#[cfg(not(unix))]
+async fn kill_child(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+fn verify_download(path: &Path, expected_size: u64) -> bool {
+    if expected_size == 0 {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let actual = meta.len();
+            actual >= expected_size || (expected_size > 0 && actual >= expected_size * 99 / 100)
+        }
+        Err(_) => false,
+    }
 }

@@ -255,6 +255,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest",
+ "thiserror",
  "tokio",
  "tokio-util",
  "url",

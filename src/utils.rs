@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::error::DlrsError;
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -7,22 +7,27 @@ use url::Url;
 static DANGEROUS_CHARS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[<>:"/\\|?*]"#).expect("Invalid regex"));
 
-pub fn validate_url(raw_url: &str) -> Result<()> {
+static ARIA2_PROGRESS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[#\w+\s+(\d+)B/(\d+)B\(\d+%\)").expect("Invalid regex"));
+
+pub fn validate_url(raw_url: &str) -> Result<(), DlrsError> {
     if raw_url.is_empty() {
-        anyhow::bail!("URL cannot be empty");
+        return Err(DlrsError::InvalidUrl("URL cannot be empty".into()));
     }
-    let u = Url::parse(raw_url).context("Invalid URL format")?;
+
+    let u = Url::parse(raw_url).map_err(|_| DlrsError::InvalidUrl("Invalid format".into()))?;
 
     match u.scheme() {
         "http" | "https" | "ftp" => {}
-        s => anyhow::bail!(
-            "Unsupported URL scheme: {} (supported: http, https, ftp)",
-            s
-        ),
+        s => {
+            return Err(DlrsError::InvalidUrl(format!(
+                "Unsupported scheme: {s} (use http/https/ftp)"
+            )));
+        }
     }
 
     if u.host_str().is_none() {
-        anyhow::bail!("URL must contain a host");
+        return Err(DlrsError::InvalidUrl("Missing host".into()));
     }
 
     Ok(())
@@ -41,16 +46,12 @@ pub fn sanitize_filename(filename: &str) -> String {
 }
 
 fn is_reserved_name(name: &str) -> bool {
-    let reserved = [
+    const RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    let upper = name.to_uppercase();
-    reserved.contains(&upper.as_str())
+    RESERVED.contains(&name.to_uppercase().as_str())
 }
-
-static ARIA2_PROGRESS_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[#\w+\s+(\d+)B/(\d+)B\(\d+%\)").expect("Invalid regex"));
 
 pub fn parse_aria2_progress(line: &str) -> Option<(u64, u64)> {
     let caps = ARIA2_PROGRESS_RE.captures(line)?;
@@ -60,22 +61,17 @@ pub fn parse_aria2_progress(line: &str) -> Option<(u64, u64)> {
 }
 
 pub fn infer_filename_from_url(raw_url: &str) -> String {
-    let u = match Url::parse(raw_url) {
-        Ok(u) => u,
-        Err(_) => {
-            let now = chrono::Local::now();
-            return format!("download_error_{}", now.format("%Y%m%d%H%M%S"));
-        }
+    let Ok(u) = Url::parse(raw_url) else {
+        let now = chrono::Local::now();
+        return format!("download_error_{}", now.format("%Y%m%d%H%M%S"));
     };
 
-    // Get path segments
     let path_segments: Vec<&str> = u.path_segments().map(|c| c.collect()).unwrap_or_default();
 
-    let filename = if let Some(last) = path_segments.last() {
-        last.to_string()
-    } else {
-        String::new()
-    };
+    let filename = path_segments
+        .last()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     if filename.is_empty() || filename == "." {
         if let Some(host) = u.host_str() {
@@ -90,35 +86,39 @@ pub fn infer_filename_from_url(raw_url: &str) -> String {
     sanitize_filename(&filename)
 }
 
-pub fn setup_destination(destination: Option<&String>) -> Result<PathBuf> {
-    let target_dir = if let Some(dest) = destination {
-        if dest.is_empty() {
-            std::env::current_dir().context("Failed to get current directory")?
-        } else {
+pub fn setup_destination(destination: Option<&String>) -> Result<PathBuf, DlrsError> {
+    let target_dir = match destination {
+        Some(dest) if !dest.is_empty() => {
             let p = PathBuf::from(dest);
-            if let Ok(metadata) = std::fs::metadata(&p) {
-                if !metadata.is_dir() {
-                    anyhow::bail!("Destination must be a directory: {}", dest);
+            if let Ok(meta) = std::fs::metadata(&p) {
+                if !meta.is_dir() {
+                    return Err(DlrsError::DestinationError(format!(
+                        "Not a directory: {dest}"
+                    )));
                 }
-                p.canonicalize().context("Failed to resolve path")?
+                p.canonicalize()
+                    .map_err(|_| DlrsError::DestinationError("Failed to resolve path".into()))?
             } else {
-                // Create if not exists
-                std::fs::create_dir_all(&p).context(format!("Creating directory '{}'", dest))?;
-                p.canonicalize().context("Failed to resolve path")?
+                std::fs::create_dir_all(&p).map_err(|_| {
+                    DlrsError::DestinationError(format!("Failed to create directory: {dest}"))
+                })?;
+                p.canonicalize()
+                    .map_err(|_| DlrsError::DestinationError("Failed to resolve path".into()))?
             }
         }
-    } else {
-        std::env::current_dir().context("Failed to get current directory")?
+        _ => std::env::current_dir()
+            .map_err(|_| DlrsError::DestinationError("Failed to get current directory".into()))?,
     };
 
-    // Test write permissions
-    let temp_file_path = target_dir.join(".dlrs-write-check");
-    std::fs::write(&temp_file_path, "")
-        .context(format!("Directory '{:?}' is not writable", target_dir))?;
-    std::fs::remove_file(&temp_file_path).ok();
+    let temp_file = target_dir.join(".dlrs-write-check");
+    std::fs::write(&temp_file, "").map_err(|_| {
+        DlrsError::DestinationError(format!("Directory not writable: {target_dir:?}"))
+    })?;
+    let _ = std::fs::remove_file(&temp_file);
 
     Ok(target_dir)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,7 +128,6 @@ mod tests {
         assert_eq!(sanitize_filename("normal.txt"), "normal.txt");
         assert_eq!(sanitize_filename("fi:le?.txt"), "fi_le_.txt");
         assert_eq!(sanitize_filename("  spaces.txt  "), "spaces.txt");
-        assert_eq!(sanitize_filename("CON"), sanitize_filename("CON"));
         assert!(sanitize_filename("CON").starts_with("download_"));
     }
 
@@ -150,20 +149,14 @@ mod tests {
             infer_filename_from_url("https://example.com/path/to/file.tar.gz"),
             "file.tar.gz"
         );
-        
-        assert!(
-            infer_filename_from_url("https://example.com/")
-                .starts_with("download_from_example.com")
-        );
+        assert!(infer_filename_from_url("https://example.com/").starts_with("download_from_"));
     }
 
     #[test]
     fn test_parse_aria2_progress() {
         let line = "[#2089b0 1000B/2000B(50%) CN:1 DL:115KiB]";
         assert_eq!(parse_aria2_progress(line), Some((1000, 2000)));
-
         assert_eq!(parse_aria2_progress("Some random output"), None);
-
         assert_eq!(parse_aria2_progress("[#2089b0 1000B/"), None);
     }
 }

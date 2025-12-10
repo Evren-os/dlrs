@@ -40,6 +40,10 @@ pub struct Cli {
     #[arg(long = "parallel", default_value_t = 2)]
     pub parallel_downloads: usize,
 
+    /// Automatic retries for transient errors (exit code 1, 22)
+    #[arg(long = "auto-retry", default_value_t = 2)]
+    pub auto_retry: u32,
+
     /// Suppress progress display
     #[arg(long, short = 'q')]
     pub quiet: bool,

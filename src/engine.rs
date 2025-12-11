@@ -263,6 +263,16 @@ async fn spawn_and_monitor(
 
     loop {
         tokio::select! {
+            status = child.wait() => {
+                // Process exited - handle status immediately
+                return match status {
+                    Ok(s) if s.success() => Ok(()),
+                    Ok(s) => Err(s.code()
+                        .map(DlrsError::download_failed)
+                        .unwrap_or(DlrsError::Other("aria2c terminated by signal".into()))),
+                    Err(e) => Err(DlrsError::Io(e)),
+                };
+            }
             res = reader.next_line() => {
                 match res {
                     Ok(Some(line)) => {
@@ -274,8 +284,8 @@ async fn spawn_and_monitor(
                             bar.set_position(down);
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
+                    Ok(None) => continue,  // EOF on stdout, wait for process exit
+                    Err(_) => continue,    // Read error, wait for process exit
                 }
             }
             _ = ctx.cancel_token.cancelled() => {
@@ -283,17 +293,6 @@ async fn spawn_and_monitor(
                 return Err(DlrsError::Cancelled);
             }
         }
-    }
-
-    let status = child.wait().await.map_err(DlrsError::Io)?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(status
-            .code()
-            .map(DlrsError::download_failed)
-            .unwrap_or(DlrsError::Other("aria2c terminated by signal".into())))
     }
 }
 

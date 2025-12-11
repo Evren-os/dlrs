@@ -261,6 +261,8 @@ async fn spawn_and_monitor(
     let stdout = child.stdout.take().expect("stdout not captured");
     let mut reader = BufReader::new(stdout).lines();
 
+    let mut stdout_closed = false;
+
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -273,7 +275,7 @@ async fn spawn_and_monitor(
                     Err(e) => Err(DlrsError::Io(e)),
                 };
             }
-            res = reader.next_line() => {
+            res = reader.next_line(), if !stdout_closed => {
                 match res {
                     Ok(Some(line)) => {
                         if let (Some((down, total)), Some(bar)) =
@@ -284,8 +286,12 @@ async fn spawn_and_monitor(
                             bar.set_position(down);
                         }
                     }
-                    Ok(None) => continue,  // EOF on stdout, wait for process exit
-                    Err(_) => continue,    // Read error, wait for process exit
+                    Ok(None) => {
+                        stdout_closed = true;
+                    }
+                    Err(_) => {
+                        stdout_closed = true;
+                    }
                 }
             }
             _ = ctx.cancel_token.cancelled() => {

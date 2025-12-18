@@ -4,7 +4,7 @@ mod error;
 mod utils;
 
 use crate::cli::Cli;
-use crate::engine::{DownloadItem, download_file};
+use crate::engine::download_file;
 use crate::error::DlrsError;
 use crate::utils::{setup_destination, validate_url};
 use clap::Parser;
@@ -15,6 +15,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 fn check_aria2c() -> Result<(), DlrsError> {
     Command::new("aria2c")
@@ -84,10 +85,7 @@ async fn main() {
     }
 }
 
-async fn run_downloads(
-    cli: &Cli,
-    cancel_token: tokio_util::sync::CancellationToken,
-) -> Result<(), DlrsError> {
+async fn run_downloads(cli: &Cli, cancel_token: CancellationToken) -> Result<(), DlrsError> {
     for url in &cli.urls {
         validate_url(url)?;
     }
@@ -104,12 +102,18 @@ async fn run_downloads(
         log_info(&msg);
     }
 
-    let mp = (!cli.quiet).then(MultiProgress::new);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(cli.connect_timeout))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| DlrsError::Other(e.to_string()))?;
+
+    let client = Arc::new(client);
+    let mp = (!cli.quiet).then(MultiProgress::new).map(Arc::new);
     let cli = Arc::new(cli.clone());
     let target_dir_str = Arc::new(target_dir_str);
-    let mp = Arc::new(mp);
 
-    let main_pb = mp.as_ref().as_ref().and_then(|m| {
+    let main_pb = mp.as_deref().and_then(|m| {
         (cli.urls.len() > 1).then(|| {
             let pb = m.add(ProgressBar::new(cli.urls.len() as u64));
             pb.set_style(
@@ -122,18 +126,9 @@ async fn run_downloads(
         })
     });
 
-    let downloads: Vec<_> = cli
-        .urls
-        .iter()
-        .map(|u| DownloadItem {
-            url: u.clone(),
-            filename: String::new(),
-            file_path: String::new(),
-        })
-        .collect();
-
-    let mut stream = stream::iter(downloads)
-        .map(|mut item| {
+    let mut stream = stream::iter(cli.urls.clone())
+        .map(|url| {
+            let client = client.clone();
             let cli = cli.clone();
             let target_dir_str = target_dir_str.clone();
             let mp = mp.clone();
@@ -142,10 +137,11 @@ async fn run_downloads(
 
             async move {
                 let res = download_file(
-                    &mut item,
+                    &client,
+                    &url,
                     &target_dir_str,
                     &cli,
-                    mp.as_ref().as_ref(),
+                    mp.as_deref(),
                     cancel_token,
                 )
                 .await;
@@ -154,7 +150,7 @@ async fn run_downloads(
                     pb.inc(1);
                 }
 
-                res.map_err(|e| DlrsError::Other(format!("{}: {}", item.url, e)))
+                res.map_err(|e| DlrsError::Other(format!("{url}: {e}")))
             }
         })
         .buffer_unordered(cli.parallel_downloads);

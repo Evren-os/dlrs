@@ -1,70 +1,85 @@
 # dlrs
 
-A lightweight, asynchronous wrapper for `aria2c` written in Rust. 
+> Async aria2c wrapper with sane defaults
 
-This is a port of a personal legacy Go tool, designed to simplify the usage of `aria2c` by applying a specific set of "sane defaults" for general file downloading. It is built for personal utility and covers 99% of my standard downloading needs, removing the necessity to manually configure connection splitting, user agents, or filename resolution for every download.
+A lightweight Rust CLI that wraps `aria2c` with optimized settings for everyday downloading. Handles filename resolution, parallel batch downloads, and graceful interrupts out of the box.
 
-**Note:** This tool is designed primarily for **Linux and macOS** (Unix-like) systems.
+**Linux & macOS only**
+
+---
 
 ## Features
 
-*   **Smart Filename Detection**: Resolves filenames via HTTP `HEAD` requests and `Content-Disposition` headers before `aria2c` starts, preventing generic output names.
-*   **Batch Processing**: Handles multiple URLs in parallel with a configurable concurrency limit.
-*   **Opinionated Defaults**: Automatically configures `aria2c` with optimized settings (16 connections per server, 32 splits, fallocation) for stable and fast downloads.
-*   **Clean UI**: Replaces verbose logs with simple progress spinners for batch operations, while retaining detailed output for single files.
-*   **Resilient**: Handles interruptions (Ctrl+C) gracefully by ensuring child processes are terminated correctly.
+- **Smart filenames** — Resolves names via `Content-Disposition` headers before download
+- **Batch downloads** — Parallel processing with configurable concurrency
+- **Optimized defaults** — 16 connections, 32 splits, falloc allocation
+- **Auto-retry** — Transient failures retry with exponential backoff
+- **Clean UI** — Progress bars for batches, detailed output for single files
+- **Graceful shutdown** — Proper SIGTERM/SIGKILL handling on Ctrl+C
 
-## Prerequisites
+---
 
-*   **aria2c**: Must be installed and available in your system `PATH`.
-    *   Linux (Arch): `sudo pacman -S aria2`
-    *   Linux (Debian/Ubuntu): `sudo apt install aria2`
-    *   macOS: `brew install aria2`
+## Requirements
 
-## Installation
+```bash
+# Arch
+sudo pacman -S aria2
 
-**This project is distributed as source-only.** It is not available on crates.io or the AUR.
+# Debian/Ubuntu
+sudo apt install aria2
+
+# macOS
+brew install aria2
+```
+
+---
+
+## Install
 
 ```bash
 git clone https://github.com/Evren-os/dlrs.git
 cd dlrs
 cargo build --release
-# Optional: Install to your path
-sudo cp target/release/dlrs /usr/local/bin/dlrs
+sudo cp target/release/dlrs /usr/local/bin/
 ```
+
+---
 
 ## Usage
 
-**Single File Download**
-Downloads a single file with full `aria2c` terminal output.
-
 ```bash
+# Single file
 dlrs https://example.com/file.zip
+
+# Multiple files (4 concurrent)
+dlrs --parallel 4 https://example.com/a.zip https://example.com/b.zip
+
+# Custom destination
+dlrs -d ~/Downloads https://example.com/file.zip
+
+# With speed limit
+dlrs --max-speed 2M https://example.com/large.iso
 ```
 
-**Batch Download**
-Downloads multiple files in parallel (default: 2) with a minimized UI.
+---
 
-```bash
-dlrs --parallel 4 https://example.com/a.zip https://example.com/b.zip https://example.com/c.zip
-```
-
-**Custom Directory**
-
-```bash
-dlrs -d ~/Downloads https://example.com/image.png
-```
-
-### Options
+## Options
 
 | Flag | Description | Default |
-| :--- | :--- | :--- |
-| `-d, --destination` | Target directory for downloads | Current Dir |
-| `--parallel` | Number of concurrent downloads | `2` |
-| `--max-speed` | Bandwidth limit (e.g., `1M`, `500K`) | Unlimited |
-| `--timeout` | Download timeout in seconds | `60` |
-| `-q, --quiet` | Suppress all output | `false` |
+|:-----|:------------|:-------:|
+| `-d, --destination` | Target directory | `.` |
+| `--parallel` | Concurrent downloads | `2` |
+| `--max-speed` | Bandwidth limit (e.g. `1M`) | — |
+| `--timeout` | Download timeout (sec) | `60` |
+| `--connect-timeout` | Connection timeout (sec) | `30` |
+| `--max-tries` | Max retry attempts | `5` |
+| `--retry-wait` | Delay between retries (sec) | `10` |
+| `--auto-retry` | Auto-retries for transient errors | `2` |
+| `--user-agent` | Custom User-Agent | — |
+| `-q, --quiet` | Suppress output | `false` |
+
+---
 
 ## License
 
-See [LICENSE](LICENSE) file.
+See [LICENSE](LICENSE)

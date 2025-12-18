@@ -1,6 +1,6 @@
 [package]
 name = "dlrs"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -10,10 +10,12 @@ clap = { version = "4.5.52", features = ["derive"] }
 colored = "3.0.0"
 futures = "0.3.31"
 indicatif = "0.18.3"
-libc = "0.2.177"
 regex = "1.12.2"
 reqwest = { version = "0.12.24", features = ["rustls-tls"] }
 thiserror = "2"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = { version = "0.7.12", features = ["full"] }
 url = "2.5.7"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }

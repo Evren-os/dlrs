@@ -21,10 +21,6 @@ pub enum DlrsError {
     #[error("destination error: {0}")]
     DestinationError(String),
 
-    #[allow(dead_code)]
-    #[error("file verification failed: expected {expected}B, got {actual}B")]
-    VerificationFailed { expected: u64, actual: u64 },
-
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 

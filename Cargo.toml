@@ -1,21 +1,21 @@
 [package]
 name = "dlrs"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = "1.0.104"
 chrono = "0.4.38"
-clap = { version = "4.5.52", features = ["derive"] }
-colored = "3.0.0"
-futures = "0.3.31"
-indicatif = "0.18.3"
-regex = "1.12.2"
-reqwest = { version = "0.12.24", features = ["rustls-tls"] }
-thiserror = "2"
-tokio = { version = "1.48.0", features = ["full"] }
-tokio-util = { version = "0.7.12", features = ["full"] }
-url = "2.5.7"
+clap = { version = "4.6.5", features = ["derive"] }
+colored = "3.1.1"
+futures = "0.3.33"
+indicatif = "0.18.6"
+regex = "1.13.1"
+reqwest = { version = "0.13.4", features = ["rustls"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["full"] }
+url = "2.5.8"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }

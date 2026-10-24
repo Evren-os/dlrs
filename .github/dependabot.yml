@@ -17,3 +17,13 @@ updates:
     labels: ["dependencies", "rust"]
     commit-message:
       prefix: "cargo"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 5
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "ci"
